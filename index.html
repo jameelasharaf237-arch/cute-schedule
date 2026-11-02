@@ -480,38 +480,102 @@ function normalize(list){const out=[];for(const c of list||[]){
  const pr=parseRoom(c.room)||{bld:String(c.building||'?'),cam:'A'};
  out.push({code:String(c.code).trim().toUpperCase(),crn:String(c.crn||''),d,s:st,e:en,bld:pr.bld,cam:pr.cam,room:String(c.room||'').trim()})}
  return out.sort((a,b)=>a.d-b.d||toMin(a.s)-toMin(b.s))}
-const CAN_READ=!!window.claude;
-function shotButton(){if(!CAN_READ)return '';return `<label class="btn" for="shot" style="text-align:center">📸 Read my schedule screenshot</label><input id="shot" type="file" accept="image/*" hidden onchange="importShot(this.files[0]);this.value=''">`}
+function shotButton(){return `<label class="btn" for="shot" style="text-align:center">📸 Read my schedule screenshot</label><input id="shot" type="file" accept="image/*" hidden onchange="importShot(this.files[0]);this.value=''">`}
 function renderSetup(){
  return `<div class="hero"><div class="mascot bob">${charSVG(Object.keys(COURSES)[0]||'_','happy')}</div><div class="bubble">Hi! I'm Hana. Let's set up your schedule so we can walk to class together 🌸</div></div>
  <div class="card"><label class="lbl" for="me">Your name</label><input id="me" class="inp" value="${esc(state.me)}" placeholder="What should we call you?" oninput="state.me=this.value;save()">
- <p class="sub" style="margin-top:12px">${CAN_READ?'Take a screenshot of your <b>Week at a Glance</b> page from the student portal, then:':'Add your classes from your student portal timetable:'}</p>
+ <p class="sub" style="margin-top:12px">Take a screenshot of your <b>Week at a Glance</b> page from the student portal, then:</p>
  ${shotButton()}<div class="imsg" id="imsg">${importMsg}</div>
  <button class="btn ghost" onclick="go('edit')">✏️ Add classes by hand</button>
  <button class="btn ghost" onclick="SCHED=SAMPLE.map(x=>({...x}));saveSched();go('home')">⭐ Try a sample schedule</button></div>
  ${draft?draftHTML():''}`;
 }
-function draftHTML(){return `<div class="card"><h3 style="margin-top:0">Found ${draft.length} classes 🎉</h3><p class="sub">Check them, then save. You can fix anything after.</p>
+function draftHTML(){return `<div class="card"><h3 style="margin-top:0">Found ${draft.length} classes 🎉</h3><p class="sub">Check them against your timetable, then save. You can fix or delete any class after.</p>
  ${draft.map(x=>`<div class="drow"><b>${esc(x.code)}</b> · ${DAYS[x.d].slice(0,3)} ${fmt(x.s)}–${fmt(x.e)}<br><small>${esc(x.room)} · Campus ${x.cam}</small></div>`).join('')}
  <button class="btn" onclick="SCHED=draft;draft=null;importMsg='';saveSched();toast('Schedule saved 🎉');go('home')">Save schedule</button><button class="btn ghost" onclick="draft=null;render()">Cancel</button></div>`}
 function shrink(file){return new Promise((res,rej)=>{const img=new Image(),u=URL.createObjectURL(file);img.onload=()=>{const sc=Math.min(1,1600/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);c.getContext('2d').drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(u);c.toBlob(b=>b?res(b):rej(),'image/jpeg',.88)};img.onerror=()=>rej();img.src=u})}
 function setMsg(t){importMsg=t;const el=$('#imsg');if(el)el.innerHTML=t}
+// Reads class blocks out of OCR words from a Banner "Week at a Glance" screenshot
+function parseWeekWords(words){
+ const DAYN=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+ const W=words.filter(w=>w.text&&w.text.trim()).map(w=>({t:w.text.trim(),x0:w.x0,y0:w.y0,x1:w.x1,y1:w.y1}));
+ const heads=[];for(const w of W){const t=w.t.toLowerCase().replace(/[^a-z]/g,'');const i=DAYN.indexOf(t);if(i>=0)heads.push({d:i,cx:(w.x0+w.x1)/2,y:w.y1,h:w.y1-w.y0})}
+ if(heads.length<3)return {error:'nodays',classes:[]};
+ let best=[];for(const h of heads){const row=heads.filter(o=>Math.abs(o.y-h.y)<h.h);const uniq=[...new Map(row.map(o=>[o.d,o])).values()];if(uniq.length>best.length)best=uniq}
+ if(best.length<3)return {error:'nodays',classes:[]};
+ best.sort((a,b)=>a.cx-b.cx);const hy=Math.max(...best.map(b=>b.y));
+ const gap=(best[best.length-1].cx-best[0].cx)/(best.length-1);
+ const bounds=best.map((b,i)=>[i?(best[i-1].cx+b.cx)/2:b.cx-gap/2,i<best.length-1?(b.cx+best[i+1].cx)/2:b.cx+gap/2]);
+ const cols=best.map(()=>[]);
+ for(const w of W){if(w.y0<hy+2)continue;const x=w.x0+Math.min((w.x1-w.x0)/2,12);const ci=bounds.findIndex(([a,b])=>x>=a&&x<b);if(ci>=0)cols[ci].push(w)}
+ const fixNum=s=>s.replace(/[Oo]/g,'0').replace(/[Il|]/g,'1').replace(/S/g,'5');
+ const out=[];
+ cols.forEach((ws,ci)=>{
+  ws.sort((a,b)=>a.y0-b.y0||a.x0-b.x0);const lines=[];
+  for(const w of ws){const l=lines.find(l=>Math.abs(l.y-w.y0)<(w.y1-w.y0)*.6);if(l)l.ws.push(w);else lines.push({y:w.y0,ws:[w]})}
+  const text=lines.sort((a,b)=>a.y-b.y).map(l=>l.ws.sort((a,b)=>a.x0-b.x0).map(w=>w.t).join(' ')).join(' ');
+  const re=/\b([A-Z]{2,4})\s*([0-9OIlS]{4})\s*[-–—]\s*[0-9OIlS]{3}/g;const hits=[];let m;
+  while((m=re.exec(text)))hits.push({i:m.index,end:re.lastIndex,code:m[1]+' '+fixNum(m[2])});
+  hits.forEach((h,k)=>{const seg=text.slice(h.end,k+1<hits.length?hits[k+1].i:text.length);
+   const crn=(seg.match(/\b([0-9OIl]{5})\b/)||[])[1];
+   const tm=seg.match(/(\d{1,2})\s*[:.]\s*(\d{2})\s*(am|pm)?\s*[-–—~]\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*(am|pm)?/i);
+   const rm=seg.match(/\b(BLDG?\s*[0-9OIl]{1,2}[A-Z]?)\s+([0-9OIl]{1,2}\s*[.,]\s*[0-9A-Z]{1,4})/i);
+   if(!tm)return;
+   let a1=(tm[3]||tm[6]||'').toLowerCase(),a2=(tm[6]||tm[3]||'').toLowerCase();
+   const to24=(h,mm,ap)=>{h=+h;if(!ap)ap=h>=7&&h<12?'am':'pm';if(ap==='pm'&&h<12)h+=12;if(ap==='am'&&h===12)h=0;return String(h).padStart(2,'0')+':'+mm};
+   let s=to24(tm[1],tm[2],a1),e=to24(tm[4],tm[5],a2);
+   if(e<=s&&!tm[6])e=to24(tm[4],tm[5],'pm');
+   const room=rm?(rm[1].toUpperCase().replace(/\s+/g,'').replace(/^(BLDG?)(.*)$/,(x,p,r)=>p+fixNum(r))+' '+fixNum(rm[2].replace(/\s+/g,'').replace(',','.'))):'';
+   out.push({code:h.code,crn:crn?fixNum(crn):'',day:DAYN[best[ci].d][0].toUpperCase()+DAYN[best[ci].d].slice(1),start:s,end:e,room});
+  });
+ });
+ return {classes:out};
+}
+
+
+let tessP=null;
+function loadTess(){if(window.Tesseract)return Promise.resolve();if(tessP)return tessP;
+ tessP=new Promise((res,rej)=>{const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';sc.onload=res;sc.onerror=()=>{tessP=null;rej(new Error('load'))};document.head.appendChild(sc)});return tessP}
+function prepCanvas(file){return new Promise((res,rej)=>{const img=new Image(),u=URL.createObjectURL(file);img.onload=()=>{
+ const sc=Math.min(2,2600/img.width),c=document.createElement('canvas');c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);
+ const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(img,0,0,c.width,c.height);
+ const d=g.getImageData(0,0,c.width,c.height),px=d.data;let lo=255,hi=0;
+ for(let i=0;i<px.length;i+=4){const v=px[i]*.3+px[i+1]*.59+px[i+2]*.11;px[i]=v;if(v<lo)lo=v;if(v>hi)hi=v}
+ const k=255/Math.max(1,hi-lo);for(let i=0;i<px.length;i+=4){const v=(px[i]-lo)*k;px[i]=px[i+1]=px[i+2]=v}
+ g.putImageData(d,0,0);URL.revokeObjectURL(u);res(c)};img.onerror=()=>rej(new Error('img'));img.src=u})}
+async function ocrRead(file){
+ setMsg('<span class="spin">🔍</span> Getting the reader ready…');
+ await loadTess();
+ const canvas=await prepCanvas(file);
+ const worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')setMsg(`<span class="spin">🔍</span> Reading your schedule… ${Math.round(m.progress*100)}%`);else if(/load|init/.test(m.status))setMsg('<span class="spin">🔍</span> Getting the reader ready… (first time takes a bit)')}});
+ try{const {data}=await worker.recognize(canvas,{},{blocks:true});
+  let words=data.words;
+  if(!words||!words.length){words=[];(data.blocks||[]).forEach(b=>(b.paragraphs||[]).forEach(p=>(p.lines||[]).forEach(l=>(l.words||[]).forEach(w=>words.push(w)))))}
+  return parseWeekWords(words.map(w=>({text:w.text,x0:w.bbox.x0,y0:w.bbox.y0,x1:w.bbox.x1,y1:w.bbox.y1})));
+ }finally{worker.terminate()}
+}
 async function importShot(file){
- if(!file||importBusy)return;
- const sample=window.claude?.use?await claude.use('sample'):null;
- if(!sample){setMsg('Reading screenshots isn’t available here. Add your classes by hand instead ✏️');return}
- importBusy=true;setMsg('<span class="spin">🔍</span> Reading your schedule… this can take up to a minute');
+ if(!file||importBusy)return;importBusy=true;
  try{
-  const img=await shrink(file);
-  const data=await sample.json(`This image is a screenshot of a university weekly timetable (for example the Ellucian Banner "Week at a Glance" page at Bahrain Polytechnic). Extract every class meeting shown in the grid. A course that meets on three days is three entries. Ignore notices, banners and anything that is not a class block.
+  const sample=window.claude?.use?await claude.use('sample'):null;
+  let list;
+  if(sample){
+   setMsg('<span class="spin">🔍</span> Reading your schedule… this can take up to a minute');
+   const img=await shrink(file);
+   const data=await sample.json(`This image is a screenshot of a university weekly timetable (for example the Ellucian Banner "Week at a Glance" page at Bahrain Polytechnic). Extract every class meeting shown in the grid. A course that meets on three days is three entries. Ignore notices, banners and anything that is not a class block.
 Return only JSON in exactly this shape:
 {"classes":[{"code":"EN 7917","crn":"10361","day":"Sunday","start":"08:00","end":"09:50","room":"BLDG19 19.325"}]}
 code = course code as printed (letters, space, number, no section suffix). crn = the 5-digit number shown on the block, or "". day = English weekday name of the column. start/end = 24-hour HH:MM. room = the building and room text exactly as printed. If there are no classes, return {"classes":[]}.`,{images:[img],modelTier:'default'});
-  const list=normalize(data&&data.classes);
+   list=normalize(data&&data.classes);
+  }else{
+   const r=await ocrRead(file);
+   if(r.error==='nodays'){setMsg('I couldn’t find the Sunday–Saturday header. Use a screenshot of the full <b>Week at a Glance</b> grid 📸');return}
+   list=normalize(r.classes);
+  }
   if(!list.length){setMsg('I couldn’t find any classes in that picture. Try a clearer screenshot of the whole week 📸')}
   else{draft=list;setMsg('');render()}
  }catch(e){const m={not_granted:'You didn’t allow reading the picture, so nothing was sent. Add classes by hand instead ✏️',rate_limited:'Too many tries right now. Wait a minute and try again.',image_rejected:'That picture couldn’t be read. Try a PNG or JPG screenshot.',images_unavailable:'Reading pictures isn’t available here. Add classes by hand instead ✏️',invalid_json:'I got confused reading that one. Try again with a clearer screenshot.'};
-  setMsg(m[e&&e.code]||'Something went wrong reading the picture. Try again, or add classes by hand.')}
+  setMsg(m[e&&e.code]||(e&&e.message==='load'?'The reader needs internet the first time. Connect and try again 📶':'Something went wrong reading the picture. Try again, or add classes by hand.'))}
  finally{importBusy=false}
 }
 function renderEdit(){
